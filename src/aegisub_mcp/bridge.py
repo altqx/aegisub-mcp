@@ -152,7 +152,7 @@ EVENT_FIELDS = ("layer", "start_time", "end_time", "style", "actor",
 # Keys of Bridge._fingerprint(); also the fields poll() reads back out of the
 # last journal entry (journal entries are flat, so they cannot be nested).
 FINGERPRINT_FIELDS = ("ae_rev", "applied_rev", "applied_result", "snapshot",
-                      "autosave", "dirty", "event_count")
+                      "autosave", "source", "dirty", "event_count")
 
 BRIDGE_README = """\
 krapau-bridge -- file bridge between Aegisub and aegisub-mcp
@@ -721,8 +721,52 @@ class Bridge:
                 "applied_result": applied.get("result") or "",
                 "snapshot": snapshot or "",
                 "autosave": autosave,
+                "source": self._source_fingerprint(state),
                 "dirty": bool(state.get("dirty")),
                 "event_count": state.get("event_count") or 0}
+
+    def _source_fingerprint(self, state: Mapping[str, Any] | None = None) -> str:
+        """Fingerprint the subtitle file Aegisub is editing, if we can find it.
+
+        ``?script`` is the *directory* holding the open script (Aegisub stores
+        ``Properties`` relative to it), and Automation 4 exposes no way to ask for
+        the file name, so track the newest ``*.ass`` in that directory. Aegisub's
+        "save on every change" rewrites that file and moves nothing inside the
+        bridge directory, so without this the MCP side sees no event until the
+        user triggers a push.
+        """
+        newest = self._newest_source(state)
+        if newest is None:
+            return ""
+        stat = newest.stat()
+        return f"{newest}:{int(stat.st_mtime)}:{stat.st_size}"
+
+    def _newest_source(self, state: Mapping[str, Any] | None = None) -> Path | None:
+        """Newest ``*.ass`` in the directory Aegisub reports for the open script."""
+        info = self.read_state() if state is None else state
+        raw = str(info.get("script") or "")
+        if not raw:
+            return None
+        try:
+            folder = Path(decode_aegisub_path(raw, user=user_dir()))
+            candidates = [p for p in folder.glob("*.ass") if p.is_file()]
+        except OSError:
+            return None
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def _source_detail(self) -> dict[str, Any]:
+        """Detail for an ``aegisub.source`` event: the saved file and its stats."""
+        newest = self._newest_source()
+        if newest is None:
+            return {}
+        try:
+            stat = newest.stat()
+        except OSError:
+            return {"path": str(newest), "gone": True}
+        return {"path": str(newest), "dir": str(newest.parent), "bytes": stat.st_size,
+                "mtime": stat.st_mtime, "age_s": round(now() - stat.st_mtime, 3)}
 
     def autosave_dir(self, *, user: Path | None = None) -> Path:
         """Directory Aegisub autosaves into (``Path/Auto/Save`` in config.json)."""
@@ -812,6 +856,9 @@ class Bridge:
                                "age_s": round(now() - stat.st_mtime, 3)})
             events.append(self.journal_append("aegisub.autosave", rev=current["ae_rev"],
                                               detail=detail))
+        if previous.get("source") != current["source"] and current["source"]:
+            events.append(self.journal_append("aegisub.source", rev=current["ae_rev"],
+                                              detail=self._source_detail()))
         self.remember_seen(current)
         return events
 

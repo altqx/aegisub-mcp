@@ -183,6 +183,45 @@ class TestRealtime:
         assert payload["count"] == 0
         assert payload["events"] == []
 
+    def test_aegisub_saving_its_own_file_is_an_event(self, installed_bridge: dict,
+                                                     tmp_path: Path) -> None:
+        """Saving inside Aegisub reaches the MCP side without a manual push.
+
+        Aegisub's "save on every change" rewrites the user's file in place and
+        nothing inside the bridge directory moves, so the source file has to be
+        watched or realtime edits stay invisible until the user runs the macro.
+        """
+        bridge = installed_bridge["bridge"]
+        script_dir = tmp_path / "subs"
+        script_dir.mkdir()
+        open_file = script_dir / "show.ass"
+        open_file.write_text("[Script Info]\nTitle: show\n", encoding="utf-8")
+
+        doc = AssDocument.load(str(FIXTURE))
+        engine = LuaEngine(doc, project_path=str(open_file))
+        engine.load_file(installed_bridge["script"])
+        engine.run_macro(PUSH)
+        # ``?script`` is a directory token, so the macro can only report the folder.
+        assert Path(bridge.read_state()["script"]) == script_dir
+
+        # First sighting records the file (a snapshot reports where it is).
+        baseline = B.ass_bridge_events(bridge_dir=str(bridge.dir))
+        assert "aegisub.source" in [event["kind"] for event in baseline["events"]]
+
+        # Nothing moves -> no repeat event; this is what keeps a fast poll cheap.
+        quiet = B.ass_bridge_events(since=baseline["last_seq"], bridge_dir=str(bridge.dir))
+        assert quiet["count"] == 0, [e["kind"] for e in quiet["events"]]
+
+        open_file.write_text(open_file.read_text(encoding="utf-8") + "; typed\n",
+                             encoding="utf-8")
+        events = B.ass_bridge_events(since=baseline["last_seq"],
+                                     bridge_dir=str(bridge.dir))
+        kinds = [event["kind"] for event in events["events"]]
+        assert kinds == ["aegisub.source"]
+        # Event details are flattened into the event itself.
+        assert events["events"][0]["path"] == str(open_file)
+        assert events["events"][0]["bytes"] == open_file.stat().st_size
+
 
 # --------------------------------------------------------------------------- round trip
 class TestRoundTrip:

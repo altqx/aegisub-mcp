@@ -310,3 +310,36 @@ class TestJournalFromScript:
         assert bridge.seen_path.read_text(encoding="utf-8").strip().startswith("{")
         payload = json.loads(json.dumps([e.to_dict() for e in events]))
         assert all("seq" in item for item in payload)
+
+
+class TestScriptDirectoryPublication:
+    """The MCP side cannot guess which file Aegisub has open, so the script says.
+
+    ``?script`` is the *directory* holding the open file.  Publishing it at load
+    time is what lets ``ass_bridge_watch`` notice the user's own saves before the
+    next pull happens.
+    """
+
+    def _target(self, tmp_path: Path) -> Path:
+        folder = tmp_path / "subs"
+        folder.mkdir()
+        target = folder / "show.ass"
+        target.write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
+        return target
+
+    def test_loading_the_script_records_the_script_directory(self, installed, tmp_path):
+        target = self._target(tmp_path)
+        load(installed["script"], target)
+        assert installed["bridge"].read_state()["script"] == str(target.parent)
+
+    def test_loading_the_script_keeps_the_revision_bookkeeping(self, installed, tmp_path):
+        # Re-writing the whole state at load would forget which revision was
+        # already applied, so the next pull would apply it a second time.
+        target = self._target(tmp_path)
+        (installed["dir"] / "state.tsv").write_text(
+            "format\tkrapau-bridge/1\nae_rev\t7\norigin\tpull-applied\n", encoding="utf-8")
+        load(installed["script"], target)
+        state = installed["bridge"].read_state()
+        assert state["ae_rev"] == 7
+        assert state["origin"] == "pull-applied"
+        assert state["script"] == str(target.parent)

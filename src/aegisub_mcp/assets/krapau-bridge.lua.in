@@ -450,6 +450,38 @@ local function write_applied(rev, result, error_text, lines, ae_rev)
   return write_file(APPLIED_PATH, dump_rows(rows))
 end
 
+-- Aegisub is the only side that knows which file it is editing, so the MCP side
+-- has to be told.  ``project_properties()`` carries no path, and the path token
+-- ``?script`` is the *directory* holding the current script (the token decodes
+-- to itself when nothing is open) -- that folder is what the MCP side watches to
+-- notice the user's own saves before the next pull ever runs.
+local function current_script_dir()
+  local ok, decoded = pcall(aegisub.decode_path, "?script")
+  if not ok or type(decoded) ~= "string" or decoded == "?script" then return "" end
+  return decoded
+end
+
+-- Called once at load: merge the script directory into the state file.  It must
+-- merge rather than overwrite -- rewriting the whole state at startup would
+-- forget which revision was already applied and re-apply it on the next pull.
+-- Aegisub sets the ``?script`` token when a subtitle file is opened, which for an
+-- autoload script happens *after* this chunk has run -- so publishing must also
+-- repeat later.  It is therefore called from ``validate_pull`` as well, and it
+-- skips the write when nothing changed.
+local function publish_script_dir()
+  local rows = read_rows(STATE_PATH) or { { "format", BRIDGE_FORMAT } }
+  local dir = current_script_dir()
+  local found, same = false, false
+  for _, row in ipairs(rows) do
+    if row[1] == "script" then found = true same = (row[2] == dir) end
+  end
+  if found and same then return end
+  if not found then rows[#rows + 1] = { "script", dir } else
+    for _, row in ipairs(rows) do if row[1] == "script" then row[2] = dir end end
+  end
+  pcall(write_file, STATE_PATH, dump_rows(rows))
+end
+
 local function push_state(subs, sel, active, trigger, force)
   local text = dump_document(subs)
   local digest = hash_text(text)
@@ -473,12 +505,16 @@ local function push_state(subs, sel, active, trigger, force)
   if not ok_version or automation_version == nil then automation_version = "" end
   local selection = {}
   for _, value in ipairs(sel or {}) do selection[#selection + 1] = tostring(value) end
+  -- ``project_properties()`` carries no script path, so ask for the path token
+  -- instead: the MCP side fingerprints that folder to notice edits Aegisub saved
+  -- before the next pull ever runs.
+  local script_path = current_script_dir()
   local rows = {
     { "format", BRIDGE_FORMAT },
     { "ae_rev", tostring(state.ae_rev) },
     { "time", string.format("%.3f", os.time()) },
     { "time_iso", now_iso() },
-    { "script", tostring(project.path or "") },
+    { "script", script_path },
     { "script_name", SCRIPT_NAME .. " " .. SCRIPT_VERSION },
     { "trigger", trigger or "push" },
     { "origin", trigger == "pull" and "pull-applied" or "aegisub" },
@@ -587,6 +623,9 @@ end
 -- open Aegisub window without anyone touching Aegisub).
 local function validate_pull(subs, sel, active)
   if not subs then return false end
+  -- Aegisub calls this whenever it builds the Automation menu, i.e. after the
+  -- subtitle file is open -- the first moment ``?script`` resolves to a folder.
+  pcall(publish_script_dir)
   local ok, kv = pcall(request_rows, REQUEST_PATH)
   if not ok or not kv then return false end
   local rev = tonumber(kv.rev or "0") or 0
@@ -612,6 +651,7 @@ end
 ----------------------------------------------------------------------- startup
 
 initial_rev()
+publish_script_dir()
 
 aegisub.register_macro(SCRIPT_NAME .. ": Pull changes from MCP",
   "Apply the revision queued by aegisub-mcp to this document (one undo point).",

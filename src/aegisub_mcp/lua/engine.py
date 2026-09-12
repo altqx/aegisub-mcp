@@ -1249,6 +1249,19 @@ class LuaEngine:
                 return target
         return None
 
+    def _script_folder(self) -> Path:
+        """The folder of the open subtitle file, for the ``?script`` token.
+
+        Aegisub resolves ``?script`` to a *directory*: the one holding the file it
+        has open, which is also what makes ``?script/x.lua`` in a script path
+        relative to the subtitles.  The engine therefore prefers the document it
+        was handed over the process working directory.
+        """
+        for candidate in (self.project_path, getattr(self.doc, "path", None)):
+            if candidate:
+                return Path(candidate).expanduser().parent
+        return Path.cwd()
+
     def decode_path(self, spec: str) -> str:
         """Turn an Aegisub path specifier (``?script/x.lua``) into a real path."""
         if not spec.startswith("?"):
@@ -1257,8 +1270,7 @@ class LuaEngine:
         head, _, tail = body.partition("/")
         folder: str | None = None
         if head == "script":
-            base = Path(self.project_path).expanduser().parent if self.project_path else Path.cwd()
-            folder = str(base)
+            folder = str(self._script_folder())
         elif head in {"data", "user"}:
             folder = str(Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "aegisub")
         elif head == "temp":
