@@ -437,7 +437,7 @@ def build_server(
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise ImportError(
             "the `mcp` Python SDK is required to run the aegisub-mcp server "
-            "(pip install 'mcp>=1.2'); see https://py.sdk.modelcontextprotocol.io/"
+            "(pip install 'mcp>=2.2'); see https://py.sdk.modelcontextprotocol.io/"
         ) from exc
 
     _harden_logging()

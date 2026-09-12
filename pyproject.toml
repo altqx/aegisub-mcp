@@ -12,7 +12,9 @@ license = { text = "MIT" }
 authors = [{ name = "altqx" }]
 keywords = ["aegisub", "ass", "subtitles", "mcp", "karaoke", "typesetting", "libass"]
 dependencies = [
-    "mcp>=1.2",
+    # 2.x is the first line that ships mcp.server.mcpserver.MCPServer, which
+    # server.py imports; 1.x only has FastMCP/Server and fails with ImportError.
+    "mcp>=2.2",
     "lupa>=2.0",
 ]
 
