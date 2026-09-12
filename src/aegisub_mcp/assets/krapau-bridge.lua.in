@@ -1,0 +1,626 @@
+-- krapau-bridge -- Aegisub-side half of the aegisub-mcp bridge.
+--
+-- GENERATED FILE.  The values below are substituted at install time by
+--   aegisub-mcp-bridge install
+-- so edit the template in aegisub-mcp (src/aegisub_mcp/assets/krapau-bridge.lua.in)
+-- and re-install, not this copy.
+--
+-- What it does
+--   * Pull changes from MCP  -- reads <bridge>/to-aegisub.tsv and updates the
+--     OPEN document in place: the event lines are patched field by field (only
+--     what actually differs is written), extra lines are deleted with
+--     subs.delete, missing ones appended with subs.append.  One undo point.
+--   * Push my document to MCP -- writes <bridge>/state.tsv and
+--     <bridge>/from-aegisub.ass: a full snapshot of the document *as Aegisub has
+--     it right now*, unsaved in-memory edits included.
+--   * The pull macro has a validation function, so Aegisub only enables it when
+--     a revision is actually pending -- and with AUTO_PULL on, that validation
+--     callback applies the revision the moment Aegisub checks it (no keystroke).
+--
+-- Everything here uses only documented Automation 4 API (automation/v4-docs):
+-- aegisub.register_macro, aegisub.log, aegisub.set_undo_point, aegisub.decode_path,
+-- subs[i] / subs.append / subs.delete, and the standard Lua io/os libraries that
+-- Aegisub preloads (libaegisub/lua/modules.cpp calls luaL_openlibs).
+
+local BRIDGE_DIR    = "@BRIDGE_DIR@"
+local AUTOLOAD_DIR  = "@AUTOLOAD_DIR@"
+local HOTKEY        = "@HOTKEY@"
+local AUTO_PULL     = @AUTO_PULL@
+local BRIDGE_FORMAT = "@FORMAT@"
+
+local SCRIPT_NAME    = "krapau-bridge"
+local SCRIPT_VERSION = "1.0.0"
+
+local STATE_PATH    = BRIDGE_DIR .. "/state.tsv"
+local SNAPSHOT_PATH = BRIDGE_DIR .. "/from-aegisub.ass"
+local REQUEST_PATH  = BRIDGE_DIR .. "/to-aegisub.tsv"
+local APPLIED_PATH  = BRIDGE_DIR .. "/applied.tsv"
+
+-- The event-line columns of a "D" row in to-aegisub.tsv, in wire order.  A row
+-- is  D, index, <these...>  so field n lives in cell n+2.  Keep this list and
+-- aegisub_mcp.bridge.EVENT_FIELDS in step: an off-by-one here silently shifts
+-- every value into the neighbouring field (which is exactly the bug this
+-- comment exists to prevent).
+local WIRE_FIELDS = {
+  "comment", "layer", "start_time", "end_time", "style", "actor",
+  "margin_l", "margin_r", "margin_t", "effect", "text",
+}
+
+local state = {
+  ae_rev = 0,       -- Aegisub-side revision counter (bumped on real changes)
+  last_hash = nil,  -- hash of the last document we pushed
+  last_apply_rev = 0,
+  busy = false,     -- re-entrancy guard for the validation hook
+}
+
+--------------------------------------------------------------------- plumbing
+
+local function say(msg)
+  -- aegisub.log takes a printf-style format plus arguments; always pass the
+  -- message as an argument so a stray '%' in subtitle text cannot break it.
+  pcall(function() aegisub.log("%s\n", tostring(msg)) end)
+end
+
+local function err_msg(err)
+  return tostring(err)
+end
+
+local function path_join(dir, name)
+  if dir:sub(-1) == "/" or dir:sub(-1) == "\\" then return dir .. name end
+  return dir .. "/" .. name
+end
+
+local function read_file(path)
+  local handle = io.open(path, "rb")
+  if not handle then return nil end
+  local text = handle:read("*a")
+  handle:close()
+  if text == nil then return nil end
+  -- Aegisub writes plain UTF-8; strip a BOM if something added one.
+  if text:sub(1, 3) == "\239\187\191" then text = text:sub(4) end
+  return text
+end
+
+-- Aegisub ships LuaFileSystem (automation/include/lfs.lua wraps aegisub.lfs),
+-- but a script must not assume it, so the directory helper falls back to the
+-- platform shell.  The bridge directory is normally created by the MCP side;
+-- this only matters when Aegisub runs first or someone deleted it.
+local ok_lfs, lfs = pcall(require, "lfs")
+
+local function ensure_bridge_dir()
+  if ok_lfs and type(lfs) == "table" and lfs.attributes then
+    local attr = lfs.attributes(BRIDGE_DIR)
+    if attr and attr.mode == "directory" then return true end
+    if lfs.mkdir(BRIDGE_DIR) then return true end
+    local parent = BRIDGE_DIR:match("^(.*)[/\\][^/\\]+$")
+    if parent then
+      lfs.mkdir(parent)
+      if lfs.mkdir(BRIDGE_DIR) then return true end
+    end
+    return false, "cannot create " .. BRIDGE_DIR
+  end
+  local command
+  if package and package.config and package.config:sub(1, 1) == "\\" then
+    command = 'cmd /c mkdir "' .. BRIDGE_DIR .. '"'
+  else
+    command = 'mkdir -p "' .. BRIDGE_DIR .. '"'
+  end
+  local status = os.execute(command)
+  return status == 0 or status == true, command
+end
+
+local function write_file(path, text)
+  local tmp = path .. ".tmp"
+  local handle, open_err = io.open(tmp, "wb")
+  if not handle then
+    -- A missing bridge directory is the one recoverable open failure: create it
+    -- and retry once instead of losing the user's snapshot silently.
+    local made = ensure_bridge_dir()
+    if made then handle, open_err = io.open(tmp, "wb") end
+  end
+  if not handle then return nil, "cannot open " .. tmp .. ": " .. err_msg(open_err) end
+  local ok, write_err = handle:write(text)
+  handle:close()
+  if not ok then return nil, "cannot write " .. tmp .. ": " .. err_msg(write_err) end
+  -- os.rename does not replace an existing file on Windows, so remove first.
+  os.remove(path)
+  local renamed, rename_err = os.rename(tmp, path)
+  if not renamed then return nil, "cannot replace " .. path .. ": " .. err_msg(rename_err) end
+  return true
+end
+
+-- TSV cell escaping must mirror aegisub_mcp.bridge.escape/unescape exactly.
+local function tsv_escape(value)
+  local text = tostring(value == nil and "" or value)
+  text = text:gsub("\\", "\\\\")
+  text = text:gsub("\t", "\\t")
+  text = text:gsub("\r", "\\r")
+  text = text:gsub("\n", "\\n")
+  return text
+end
+
+local function tsv_unescape(value)
+  local out = {}
+  local i = 1
+  while i <= #value do
+    local char = value:sub(i, i)
+    if char == "\\" and i < #value then
+      local next_char = value:sub(i + 1, i + 1)
+      if next_char == "\\" then out[#out + 1] = "\\"; i = i + 2
+      elseif next_char == "t" then out[#out + 1] = "\t"; i = i + 2
+      elseif next_char == "r" then out[#out + 1] = "\r"; i = i + 2
+      elseif next_char == "n" then out[#out + 1] = "\n"; i = i + 2
+      else out[#out + 1] = char; i = i + 1 end
+    else
+      out[#out + 1] = char
+      i = i + 1
+    end
+  end
+  return table.concat(out)
+end
+
+local function split_tsv(line)
+  local cells = {}
+  local start = 1
+  while true do
+    local at = line:find("\t", start, true)
+    if not at then
+      cells[#cells + 1] = tsv_unescape(line:sub(start))
+      break
+    end
+    cells[#cells + 1] = tsv_unescape(line:sub(start, at - 1))
+    start = at + 1
+  end
+  return cells
+end
+
+local function read_rows(path)
+  local text = read_file(path)
+  if not text then return nil end
+  local rows = {}
+  for line in text:gmatch("[^\n]*") do
+    if line ~= "" and line:sub(1, 1) ~= "#" then rows[#rows + 1] = split_tsv(line) end
+  end
+  return rows
+end
+
+local function rows_to_kv(rows)
+  local kv = {}
+  for _, cells in ipairs(rows or {}) do
+    if #cells == 2 then kv[cells[1]] = cells[2] end
+  end
+  return kv
+end
+
+local function dump_rows(rows)
+  local out = {}
+  for _, cells in ipairs(rows) do
+    local escaped = {}
+    for i = 1, #cells do escaped[i] = tsv_escape(cells[i]) end
+    out[#out + 1] = table.concat(escaped, "\t")
+  end
+  return table.concat(out, "\n") .. "\n"
+end
+
+-- Rolling hash (djb2 over 32 bits): only ever compared against itself, so it
+-- exists to answer "did the document actually change since the last push?".
+local function hash_text(text)
+  local h = 5381
+  for i = 1, #text do
+    h = (h * 33 + text:byte(i)) % 4294967296
+  end
+  return string.format("%08x", h)
+end
+
+local function now_iso()
+  return os.date("%Y-%m-%d %H:%M:%S")
+end
+
+local function dict(key)
+  -- Shallow copy of a subtitle line table, so we never mutate a live line.
+  local out = {}
+  if type(key) == "table" then
+    for k, v in pairs(key) do out[k] = v end
+  end
+  return out
+end
+
+----------------------------------------------------------------- ass rendering
+
+-- Milliseconds -> ASS timestamp, exactly like libass/Aegisub write it.
+local function ass_time(ms)
+  local value = math.floor(tonumber(ms) or 0)
+  if value < 0 then value = 0 end
+  local cs = math.floor(value / 10) % 100
+  local seconds = math.floor(value / 1000) % 60
+  local minutes = math.floor(value / 60000) % 60
+  local hours = math.floor(value / 3600000)
+  return string.format("%d:%02d:%02d.%02d", hours, minutes, seconds, cs)
+end
+
+local function dialogue_row(line)
+  local text = tostring(line.text or "")
+  text = text:gsub("\n", "\\N")
+  return string.format("%s: %s,%s,%s,%s,%s,%s,%s,%s,%s,%s",
+    line.comment and "Comment" or "Dialogue",
+    tostring(line.layer or line.marked or 0),
+    ass_time(line.start_time), ass_time(line.end_time),
+    tostring(line.style or "Default"), tostring(line.actor or ""),
+    tostring(line.margin_l or 0), tostring(line.margin_r or 0),
+    tostring(line.margin_t or 0), tostring(line.effect or ""), text)
+end
+
+-- How many comma-separated fields a standard ASS event line carries.
+local STANDARD_EVENT_FIELDS = 9
+
+local function render_line(line)
+  local class = line.class
+  if class == "dialogue" then
+    -- Custom (non-standard) columns would be lost when rendering from the
+    -- documented fields, so keep the raw text in that case.
+    local raw = line.raw
+    if type(raw) == "string" then
+      local after = raw:match("^%s*[Dd]ialogue%s*:%s*(.*)$")
+      if not after then after = raw:match("^%s*[Cc]omment%s*:%s*(.*)$") end
+      if after then
+        local count = 1
+        for _ in after:gmatch(",") do count = count + 1 end
+        if count > STANDARD_EVENT_FIELDS then return raw end
+      end
+    end
+    return dialogue_row(line)
+  elseif class == "info" then
+    return tostring(line.key or "") .. ": " .. tostring(line.value or "")
+  elseif class == "comment" then
+    return ";" .. tostring(line.text or "")
+  elseif class == "head" then
+    return "[" .. tostring(line.section or "") .. "]"
+  elseif class == "clear" then
+    return ""
+  end
+  -- "format", "style", "stylex", "unknown": raw is the source text and cannot
+  -- be regenerated faithfully from a partial field list, so use it.
+  if type(line.raw) == "string" then return line.raw end
+  return ""
+end
+
+local function dump_document(subs)
+  local out = {}
+  local section = nil
+  for i = 1, #subs do
+    local line = subs[i]
+    if line then
+      if line.class == "head" and line.section then
+        out[#out + 1] = "[" .. line.section .. "]"
+        section = line.section
+      else
+        if line.section and line.section ~= section and line.class ~= "head" then
+          -- A line whose section is not the currently open one: emit the heading
+          -- so the snapshot stays a well-formed subtitle file.
+          out[#out + 1] = "[" .. line.section .. "]"
+          section = line.section
+        end
+        out[#out + 1] = render_line(line)
+      end
+    end
+  end
+  return table.concat(out, "\n") .. "\n"
+end
+
+------------------------------------------------------------------- pull logic
+
+local function request_rows(path)
+  local rows = read_rows(path)
+  if not rows then return nil end
+  local kv, events = {}, {}
+  for _, cells in ipairs(rows) do
+    if cells[1] == "D" then
+      events[#events + 1] = cells
+    elseif #cells == 2 then
+      kv[cells[1]] = cells[2]
+    end
+  end
+  return kv, events
+end
+
+local function dialogue_indices(subs)
+  local indices = {}
+  for i = 1, #subs do
+    local line = subs[i]
+    if line and line.class == "dialogue" then indices[#indices + 1] = i end
+  end
+  return indices
+end
+
+local function field_value(cells, name)
+  -- cells: D, index, then WIRE_FIELDS in order
+  for position, field in ipairs(WIRE_FIELDS) do
+    if field == name then return cells[position + 2] end
+  end
+  return nil
+end
+
+local function equals_number(a, b)
+  if a == nil and b == nil then return true end
+  if a == nil or b == nil then return false end
+  return math.floor(tonumber(a) or -1) == math.floor(tonumber(b) or -2)
+end
+
+local function patch_line(line, cells)
+  local changed = {}
+  local function assign(field, value)
+    line[field] = value
+    changed[#changed + 1] = field
+  end
+  local raw_comment = field_value(cells, "comment")
+  local want_comment = raw_comment == "1"
+  if (line.comment and true or false) ~= want_comment then
+    assign("comment", want_comment)
+  end
+  local layer = tonumber(field_value(cells, "layer")) or 0
+  if not equals_number(line.layer or line.marked or 0, layer) then assign("layer", layer) end
+  local start_time = tonumber(field_value(cells, "start_time"))
+  if start_time and not equals_number(line.start_time, start_time) then
+    assign("start_time", math.floor(start_time))
+  end
+  local end_time = tonumber(field_value(cells, "end_time"))
+  if end_time and not equals_number(line.end_time, end_time) then
+    assign("end_time", math.floor(end_time))
+  end
+  local style = field_value(cells, "style")
+  if style and style ~= (line.style or "") then assign("style", style) end
+  local actor = field_value(cells, "actor")
+  if actor and actor ~= (line.actor or "") then assign("actor", actor) end
+  for _, name in ipairs({ "margin_l", "margin_r", "margin_t" }) do
+    local value = tonumber(field_value(cells, name))
+    if value and not equals_number(line[name] or 0, value) then
+      assign(name, math.floor(value))
+    end
+  end
+  local effect = field_value(cells, "effect")
+  if effect and effect ~= (line.effect or "") then assign("effect", effect) end
+  local text = field_value(cells, "text")
+  if text and text ~= (line.text or "") then assign("text", text) end
+  return changed
+end
+
+local function new_line(cells)
+  local line = { class = "dialogue" }
+  line.comment = field_value(cells, "comment") == "1"
+  line.layer = tonumber(field_value(cells, "layer")) or 0
+  line.start_time = math.floor(tonumber(field_value(cells, "start_time")) or 0)
+  line.end_time = math.floor(tonumber(field_value(cells, "end_time")) or 0)
+  line.style = field_value(cells, "style") or "Default"
+  line.actor = field_value(cells, "actor") or ""
+  line.margin_l = math.floor(tonumber(field_value(cells, "margin_l")) or 0)
+  line.margin_r = math.floor(tonumber(field_value(cells, "margin_r")) or 0)
+  line.margin_t = math.floor(tonumber(field_value(cells, "margin_t")) or 0)
+  line.effect = field_value(cells, "effect") or ""
+  line.text = field_value(cells, "text") or ""
+  return line
+end
+
+local function apply_request(subs, kv, events)
+  local indices = dialogue_indices(subs)
+  local changed, appended, deleted = 0, 0, 0
+  local common = math.min(#indices, #events)
+  for k = 1, common do
+    local line = subs[indices[k]]
+    local fields = patch_line(line, events[k])
+    if #fields > 0 then
+      -- A4 hands out a *copy* of the line: writing the modified table back with
+      -- ``subs[i] = line`` is what actually touches the document
+      -- (automation/v4-docs/subtitle-data.txt -- "Replace line i with new data").
+      subs[indices[k]] = line
+      changed = changed + 1
+    end
+  end
+  if #indices > #events then
+    -- Surplus lines are always the contiguous tail of the dialogue indices, so
+    -- one deleterange both matches the intent and keeps a single undo step
+    -- (subs.delete takes separate indices counted against the *original*
+    -- numbering upstream, which is easy to get wrong and equivalent here).
+    subs.deleterange(indices[#events + 1], indices[#indices])
+    deleted = #indices - #events
+  elseif #events > #indices then
+    local fresh = {}
+    for k = #indices + 1, #events do fresh[#fresh + 1] = new_line(events[k]) end
+    subs.append(unpack(fresh))
+    appended = #fresh
+  end
+  return { changed = changed, appended = appended, deleted = deleted,
+           total = #events }
+end
+
+----------------------------------------------------------------------- state
+
+local function write_applied(rev, result, error_text, lines, ae_rev)
+  local rows = {
+    { "format", BRIDGE_FORMAT },
+    { "rev", tostring(rev) },
+    { "result", result },
+    { "time", string.format("%.3f", os.time()) },
+    { "time_iso", now_iso() },
+    { "error", error_text or "" },
+    { "lines", tostring(lines or 0) },
+    { "ae_rev", tostring(ae_rev or state.ae_rev) },
+    { "script_name", SCRIPT_NAME },
+    { "script_version", SCRIPT_VERSION },
+  }
+  return write_file(APPLIED_PATH, dump_rows(rows))
+end
+
+local function push_state(subs, sel, active, trigger, force)
+  local text = dump_document(subs)
+  local digest = hash_text(text)
+  -- ``ae_rev`` counts *content* revisions only: it is what the MCP side uses to
+  -- tell "something changed" from "Aegisub reported in again", so an explicit
+  -- push that finds the same document must not bump it (it still rewrites the
+  -- files, because the user asked for a fresh report).
+  local content_changed = state.last_hash == nil or digest ~= state.last_hash
+  if content_changed then state.ae_rev = state.ae_rev + 1 end
+  if content_changed or force then
+    local written, snapshot_err = write_file(SNAPSHOT_PATH, text)
+    if not written then return nil, snapshot_err end
+    state.last_hash = digest
+  end
+  local project = {}
+  local ok_props, props = pcall(aegisub.project_properties)
+  if ok_props and type(props) == "table" then project = props end
+  local ok_version, automation_version = pcall(function()
+    return aegisub.lua_automation_version
+  end)
+  if not ok_version or automation_version == nil then automation_version = "" end
+  local selection = {}
+  for _, value in ipairs(sel or {}) do selection[#selection + 1] = tostring(value) end
+  local rows = {
+    { "format", BRIDGE_FORMAT },
+    { "ae_rev", tostring(state.ae_rev) },
+    { "time", string.format("%.3f", os.time()) },
+    { "time_iso", now_iso() },
+    { "script", tostring(project.path or "") },
+    { "script_name", SCRIPT_NAME .. " " .. SCRIPT_VERSION },
+    { "trigger", trigger or "push" },
+    { "origin", trigger == "pull" and "pull-applied" or "aegisub" },
+    { "changed", content_changed and "1" or "0" },
+    { "hash", digest },
+    { "dirty", "1" },
+    { "line_count", tostring(#subs) },
+    { "event_count", tostring(#dialogue_indices(subs)) },
+    { "selection", table.concat(selection, ",") },
+    { "active_line", tostring(active or 0) },
+    { "aegisub_version", tostring(automation_version) },
+    { "host", tostring(os.getenv("COMPUTERNAME") or os.getenv("HOSTNAME") or "") },
+    { "bridge_dir", BRIDGE_DIR },
+    { "autoload_dir", AUTOLOAD_DIR },
+    { "hotkey", HOTKEY },
+  }
+  local wrote, err = write_file(STATE_PATH, dump_rows(rows))
+  if not wrote then return nil, err end
+  return { text = text, hash = digest, changed = content_changed, rev = state.ae_rev }
+end
+
+local function initial_rev()
+  local rows = read_rows(STATE_PATH)
+  local kv = rows_to_kv(rows)
+  local rev = tonumber(kv.ae_rev or "0") or 0
+  state.ae_rev = rev
+  local snapshot = read_file(SNAPSHOT_PATH)
+  if snapshot then state.last_hash = hash_text(snapshot) end
+  local applied = rows_to_kv(read_rows(APPLIED_PATH))
+  state.last_apply_rev = tonumber(applied.rev or "0") or 0
+end
+
+----------------------------------------------------------------------- macros
+
+local function pull(subs, sel, active)
+  if not subs then return false, "no subtitles open" end
+  local kv, events = request_rows(REQUEST_PATH)
+  if not kv then
+    return false, "no request file yet at " .. REQUEST_PATH
+  end
+  local rev = tonumber(kv.rev or "0") or 0
+  if rev <= state.last_apply_rev then
+    return true, string.format("nothing pending (request rev %d, applied rev %d)",
+                               rev, state.last_apply_rev)
+  end
+  local ok, outcome = pcall(apply_request, subs, kv, events)
+  if not ok then
+    write_applied(rev, "error", err_msg(outcome), #subs)
+    return false, "apply failed: " .. err_msg(outcome)
+  end
+  state.last_apply_rev = rev
+  local note = tostring(kv.note or "")
+  pcall(function()
+    aegisub.set_undo_point(string.format("%s: pull rev %d%s", SCRIPT_NAME, rev,
+      note ~= "" and (" -- " .. note) or ""))
+  end)
+  write_applied(rev, "ok", "", #subs)
+  return true, string.format(
+    "rev %d applied: %d line(s) changed, %d appended, %d deleted",
+    rev, outcome.changed, outcome.appended, outcome.deleted)
+end
+
+local function macro_pull(subs, sel, active)
+  if not subs then
+    aegisub.log("%s: no subtitles open\n", SCRIPT_NAME)
+    return
+  end
+  local ok, message = pull(subs, sel, active)
+  say((ok and "pull ok: " or "pull failed: ") .. tostring(message))
+  if ok then pcall(push_state, subs, sel, active, "pull", true) end
+end
+
+local function macro_push(subs, sel, active)
+  if not subs then
+    aegisub.log("%s: no subtitles open\n", SCRIPT_NAME)
+    return
+  end
+  local result, err = push_state(subs, sel, active, "push", true)
+  if not result then
+    say("push failed: " .. tostring(err))
+    return
+  end
+  say(string.format("pushed ae_rev %d (%d line(s), %s) -> %s",
+    result.rev, #subs, result.hash, SNAPSHOT_PATH))
+end
+
+local function macro_status(subs, sel, active)
+  local kv = rows_to_kv(read_rows(STATE_PATH))
+  local applied = rows_to_kv(read_rows(APPLIED_PATH))
+  local request = rows_to_kv(read_rows(REQUEST_PATH))
+  say(string.format(
+    "%s %s\n  bridge dir       : %s\n  installed from   : %s\n  hotkey           : %s\n"
+    .. "  auto pull        : %s\n  ae_rev           : %s\n  last request rev : %s\n"
+    .. "  last applied rev : %s (%s)\n  document open    : %s\n  event lines      : %s\n"
+    .. "  state file       : %s",
+    SCRIPT_NAME, SCRIPT_VERSION, BRIDGE_DIR, AUTOLOAD_DIR, HOTKEY,
+    AUTO_PULL and "on" or "off", kv.ae_rev or "-", request.rev or "-",
+    applied.rev or "-", applied.result or "-", subs and "yes" or "no",
+    subs and tostring(#dialogue_indices(subs)) or "-", STATE_PATH))
+end
+
+-- Validation callback (4th argument of register_macro).  Aegisub calls it when
+-- it needs to know whether the macro is applicable -- so it doubles as the
+-- bridge's "is there anything for you?" check, and with AUTO_PULL on it applies
+-- the pending revision right there (that is how an MCP edit can show up in an
+-- open Aegisub window without anyone touching Aegisub).
+local function validate_pull(subs, sel, active)
+  if not subs then return false end
+  local ok, kv = pcall(request_rows, REQUEST_PATH)
+  if not ok or not kv then return false end
+  local rev = tonumber(kv.rev or "0") or 0
+  local pending = rev > state.last_apply_rev
+  if pending and AUTO_PULL and not state.busy then
+    state.busy = true
+    local applied, message = pcall(pull, subs, sel, active)
+    state.busy = false
+    if applied then
+      pcall(push_state, subs, sel, active, "pull", true)
+      say("auto-pulled rev " .. tostring(rev))
+    else
+      say("auto-pull failed: " .. tostring(message))
+    end
+  end
+  -- Report whether a revision *was* pending: Aegisub uses the return value to
+  -- enable/disable the macro entry, and the run Aegisub performs right after a
+  -- menu click or hotkey then reports "nothing pending" because the revision is
+  -- already applied.  Never report pending work as done-and-gone.
+  return pending
+end
+
+----------------------------------------------------------------------- startup
+
+initial_rev()
+
+aegisub.register_macro(SCRIPT_NAME .. ": Pull changes from MCP",
+  "Apply the revision queued by aegisub-mcp to this document (one undo point).",
+  macro_pull, validate_pull)
+
+aegisub.register_macro(SCRIPT_NAME .. ": Push my document to MCP",
+  "Write this document -- including unsaved edits -- to the bridge so aegisub-mcp can read it.",
+  macro_push)
+
+aegisub.register_macro(SCRIPT_NAME .. ": Bridge status",
+  "Log the bridge paths, revisions and settings into the Aegisub log.",
+  macro_status)

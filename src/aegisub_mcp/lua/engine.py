@@ -349,6 +349,9 @@ class MacroResult:
     progress: float | None = None
     undo_points: list[str] = _dc_field(default_factory=list)
     dialogs: list[dict[str, Any]] = _dc_field(default_factory=list)
+    # Dialogs the script opened that had no configured answer.  Non-empty means
+    # the script was interrupted by an unattended dialog, so ``ok`` is False.
+    dialog_failures: list[str] = _dc_field(default_factory=list)
     unsupported: list[str] = _dc_field(default_factory=list)
     elapsed_ms: float = 0.0
     lines_before: int = 0
@@ -379,6 +382,7 @@ class MacroResult:
             "progress": self.progress,
             "undo_points": self.undo_points,
             "dialogs": self.dialogs,
+            "dialog_failures": self.dialog_failures,
             "unsupported": self.unsupported,
             "elapsed_ms": round(self.elapsed_ms, 3),
             "lines_before": self.lines_before,
@@ -531,6 +535,12 @@ class LuaEngine:
         self.output: list[dict[str, Any]] = []
         self.undo_points: list[str] = []
         self.dialogs: list[dict[str, Any]] = []
+        # Dialogs the script opened but that had no configured answer.  They are
+        # *not* raised across the Lua boundary: a Python exception escaping into
+        # lupa inside xpcall surfaces as a useless "error in error handling", so
+        # the run continues as if the user closed the dialog and the messages are
+        # folded into the final result by :meth:`_finish`.
+        self.dialog_failures: list[str] = []
         self.progress_title: str | None = None
         self.progress_task: str | None = None
         self.progress: float | None = None
@@ -883,27 +893,37 @@ class LuaEngine:
             )
         )
 
-    def _api_dialog_display(self, dialog: Any, buttons: Any = None, config: Any = None) -> Any:
-        spec = lua_to_py(dialog) or {}
+    def _api_dialog_display(self, dialog: Any, buttons: Any = None, button_ids: Any = None) -> Any:
+        # Aegisub passes the *array* of controls as the first argument: LuaDialog
+        # walks argument 1 with ``lua_for_each`` (src/auto4_lua_dialog.cpp).  A
+        # ``{controls = {...}}`` wrapper is tolerated as well because it is a
+        # common mistake, but scripts in the wild use the array form.
+        raw = lua_to_py(dialog)
+        if isinstance(raw, list):
+            controls, spec = raw, {}
+        elif isinstance(raw, dict):
+            controls, spec = raw.get("controls") or [], raw
+        else:
+            controls, spec = [], {}
         button_spec = lua_to_py(buttons)
-        if isinstance(button_spec, dict):  # two-argument form: display(dialog, config)
-            config, button_spec = button_spec, None
+        ids: dict[str, Any] = {}
+        if isinstance(button_spec, dict):
+            # ``display(dialog, button_ids)``: argument 3 maps wx ids onto labels.
+            ids, button_spec = button_spec, None
+        if isinstance(button_ids, dict) and not ids:
+            ids = lua_to_py(button_ids) or {}
         names: list[str] = []
-        values: dict[str, Any] = {}
         if isinstance(button_spec, list):
             names = [f"Button {i + 1}" if b is None else str(b) for i, b in enumerate(button_spec)]
         elif isinstance(button_spec, dict):
-            for key, label in button_spec.items():
-                names.append(str(label if label is not None else key))
-                values[str(key)] = str(label)
+            names = [str(label) for label in button_spec.values()]
+        names = [name for name in names if name]
         if not names:
+            # Aegisub falls back to the stock OK/Cancel pair.
             names = ["OK", "Cancel"]
-        keys: list[str] = []
-        for key, label in values.items():
-            if key not in keys and isinstance(label, str) and label.strip():
-                keys.append(key)
+        keys: list[str] = [str(key) for key, label in ids.items()
+                           if isinstance(label, str) and label.strip()]
         defaults: dict[str, Any] = {}
-        controls = spec.get("controls") or []
         if isinstance(controls, list):
             for control in controls:
                 if not isinstance(control, dict):
@@ -911,8 +931,29 @@ class LuaEngine:
                 key = control.get("name") or control.get("id") or control.get("key")
                 if key:
                     defaults[str(key)] = control.get("value", "")
-        record = {"kind": "display", "title": spec.get("title", ""), "buttons": names, "keys": keys}
+        record = {"kind": "display", "title": spec.get("title", ""), "buttons": names,
+                  "keys": keys, "controls": controls}
         return self._answer_dialog(record, defaults, names)
+
+    @staticmethod
+    def _button_index(button: Any, names: list[str]) -> int | None:
+        """Resolve a 1-based index or a button label to an index, ``None`` = close."""
+        if isinstance(button, bool):
+            return 1 if button else None
+        if isinstance(button, str):
+            return names.index(button) + 1 if button in names else None
+        try:
+            index = int(button)
+        except (TypeError, ValueError):
+            return None
+        return index if 1 <= index <= len(names) else None
+
+    @staticmethod
+    def _button_label(index: int | None, names: list[str]) -> Any:
+        """What Aegisub returns: the pressed button's label, or ``false``."""
+        if index is None:
+            return False
+        return names[index - 1]
 
     def _answer_dialog(self, record: dict[str, Any], defaults: dict[str, Any], names: list[str]) -> Any:
         self.dialogs.append(record)
@@ -924,23 +965,38 @@ class LuaEngine:
             explicit = answers.get(str(record.get("kind")))
         if explicit is None and len(answers) == 1:
             explicit = next(iter(answers.values()))
+        if explicit is not None and not isinstance(explicit, (dict, int, float, str, bool)):
+            explicit = None
         if isinstance(explicit, dict):
-            button = explicit.get("button", 1)
-            result = dict(defaults)
-            result.update(explicit.get("values", {}) or {})
-            return (button, py_to_lua(result))
-        if isinstance(explicit, (int, float)):
-            return (int(explicit), py_to_lua(defaults))
-        if mode == "defaults":
-            return (1, py_to_lua(defaults))
-        if mode == "answers":
-            raise DialogUnavailable(
-                f"dialog {title or record.get('kind')!r} requested by the script has no answer configured "
-                f"(dialog_mode='answers'); supply dialog_answers for it"
-            )
-        raise DialogUnavailable(
-            f"the script opened a dialog ({title or record.get('kind')!r}); "
-            f"aegisub-mcp runs headless — pass dialog_answers for it or set dialog_mode='defaults' to accept defaults"
+            values = dict(defaults)
+            values.update(explicit.get("values", {}) or {})
+            index = self._button_index(explicit.get("button", 1), names)
+        elif isinstance(explicit, (int, float, str, bool)):
+            values = dict(defaults)
+            index = self._button_index(explicit, names)
+        elif mode == "defaults":
+            values, index = dict(defaults), 1
+        elif mode == "answers":
+            self._dialog_unanswered(record, title)
+            values, index = dict(defaults), None
+        else:
+            self._dialog_unanswered(record, title)
+            values, index = dict(defaults), None
+        record["button"] = index
+        record["values"] = values
+        return (self._button_label(index, names), py_to_lua(values))
+
+    def _dialog_unanswered(self, record: dict[str, Any], title: str) -> None:
+        """Remember a dialog that has no configured answer.
+
+        The run is *not* aborted from inside the Lua call: a Python exception
+        raised across the lupa boundary inside ``xpcall`` loses its message (Lua
+        reports a bare "error in error handling"), so the macro carries on as if
+        the user had closed the dialog and :meth:`_finish` reports the reason.
+        """
+        self.dialog_failures.append(
+            f"the script opened a dialog ({title or record.get('kind')!r}) that has no configured answer; "
+            "pass dialog_answers for it, or set dialog_mode='defaults' to accept the defaults"
         )
 
     def _api_dialog_open(self, name: Any, default_dir: Any = None, default_file: Any = None, filters: Any = None) -> Any:
@@ -952,9 +1008,8 @@ class LuaEngine:
         self.dialogs.append(record)
         if self.dialog_mode == "defaults":
             return ""
-        raise DialogUnavailable(
-            f"the script opened a file dialog ({name!r}); pass dialog_answers with that title (or 'open') to answer it"
-        )
+        self._dialog_unanswered(record, str(name or ""))
+        return None
 
     def _api_dialog_save(self, name: Any, default_dir: Any = None, default_file: Any = None, filters: Any = None) -> Any:
         record = {"kind": "save", "title": str(name or ""), "filters": lua_to_py(filters)}
@@ -964,9 +1019,8 @@ class LuaEngine:
             return answer
         if self.dialog_mode == "defaults" and default_file:
             return default_file
-        raise DialogUnavailable(
-            f"the script opened a save dialog ({name!r}); pass dialog_answers with that title (or 'save') to answer it"
-        )
+        self._dialog_unanswered(record, str(name or ""))
+        return None
 
     def _api_text_extents(self, style: Any, text: Any) -> tuple[float, float, float, float]:
         spec = lua_to_py(style)
@@ -1622,6 +1676,13 @@ class LuaEngine:
         result.cancelled = self._cancelled
         result.elapsed_ms = (time.perf_counter() - started) * 1000.0
         result.output = list(self.output)
+        result.dialog_failures = list(self.dialog_failures)
+        if result.dialog_failures:
+            # A dialog the script opened was never answered, so the script ran as
+            # if the user had closed it.  That is never a clean success.
+            note = "; ".join(result.dialog_failures)
+            result.error = f"{result.error}\n{note}" if result.error else note
+            result.ok = False
         if result.error and CANCEL_MARKER in result.error:
             result.ok = False
             result.cancelled = True
@@ -1678,18 +1739,28 @@ class LuaEngine:
         # entry out; headless the run is refused with a real error so a caller
         # cannot mistake "not applicable" for "ran fine".
         if item.is_valid is not None:
+            # ``__protected_call`` returns ``(ok, err, <what the fn returned>)``,
+            # so the validation *result* is slot 2 -- reading slot 0/1 here used to
+            # make every validate-gated macro fail with "not applicable" even when
+            # the script said yes (``valid`` was the pcall status and
+            # ``valid_err`` the error, always nil on success).
             valid_outcome = self.lua.globals()["__protected_call"](item.is_valid, subs, sel, active_line)
-            valid, valid_err = (
-                valid_outcome[0], valid_outcome[1]
-            ) if isinstance(valid_outcome, tuple) else (bool(valid_outcome), None)
-            if not valid:
+            if isinstance(valid_outcome, tuple):
+                called_ok, call_error = valid_outcome[0], valid_outcome[1]
+                valid_returns: tuple[Any, ...] = tuple(valid_outcome[2:])
+            else:  # pragma: no cover - defensive: lupa returns a tuple for multi-value calls
+                called_ok, call_error, valid_returns = bool(valid_outcome), None, ()
+            if not called_ok:
                 result.ok = False
-                result.error = str(valid_err)
+                result.error = (
+                    f"macro {item.name!r} was refused: its register_macro validation "
+                    f"function raised {call_error}"
+                )
                 finished = self._finish(result, before, started, snapshot, dry_run)
                 if raise_errors:
-                    raise LuaError(finished.error or f"macro {item.name!r} failed")
+                    raise LuaError(finished.error)
                 return finished
-            if not lua_to_py(valid_err):
+            if not (valid_returns and lua_to_py(valid_returns[0])):
                 result.ok = False
                 result.error = (
                     f"macro {item.name!r} was not applicable: its register_macro validation "
@@ -1824,11 +1895,33 @@ class LuaEngine:
         filter_config = self.lua_value(list(self.selection))
         for key, value in self.config.items():
             filter_config[str(key)] = self.lua_value(value)
-        ok, err = self.lua.globals()["__protected_call"](item.fn, subs, filter_config, active_line)
+        outcome = self.lua.globals()["__protected_call"](item.fn, subs, filter_config, active_line)
+        # ``__protected_call`` returns ``(ok, err, <whatever fn returned>)`` and
+        # the documented Automation 4 filter contract has filters returning the
+        # (possibly new) subtitles table -- upstream ``cleantags_filter`` and
+        # ``filter_apply_templates`` both do.  Unpacking exactly two values made
+        # any filter that returned something die with "too many values to
+        # unpack", so go by index like :meth:`run_macro` does.  The returned
+        # table itself is *not* re-applied: Automation 4 filters edit
+        # ``subtitles`` in place and Aegisub only reads a new active
+        # line/selection out of the return values.
+        if isinstance(outcome, tuple):
+            ok, err = outcome[0], outcome[1]
+            returns: tuple[Any, ...] = tuple(outcome[2:])
+        else:  # pragma: no cover - defensive: lupa returns a tuple for multi-value calls
+            ok, err, returns = bool(outcome), None, ()
         if not ok:
             result.ok = False
             result.error = str(err)
+        active_out = self._apply_macro_returns(returns) if ok else 0
+        if g.subs is not None and getattr(g.subs, "refresh", None):
+            try:
+                g.subs.refresh()
+            except lupa.LuaError:  # pragma: no cover - defensive
+                pass
         finished = self._finish(result, before, started, snapshot, dry_run)
+        if active_out:
+            finished.active_line = active_out
         if raise_errors and not finished.ok:
             raise LuaError(finished.error or f"filter {item.name!r} failed")
         return finished

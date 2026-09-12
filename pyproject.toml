@@ -27,9 +27,14 @@ aegisub-mcp = "aegisub_mcp.server:main"
 # Streamable HTTP, the only transport that can serve protocol 2026-07-28 (the
 # stateless per-request envelope); see src/aegisub_mcp/http_server.py.
 aegisub-mcp-http = "aegisub_mcp.http_server:main"
+# File bridge to a running Aegisub (status/publish/watch/install); see
+# src/aegisub_mcp/bridge.py and src/aegisub_mcp/assets/krapau-bridge.lua.in.
+aegisub-mcp-bridge = "aegisub_mcp.bridge:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aegisub_mcp"]
+# The Aegisub-side Lua template is data, not Python; make sure it ships.
+artifacts = ["src/aegisub_mcp/assets/*.lua.in", "src/aegisub_mcp/lua/*.lua", "src/aegisub_mcp/lua/include/*.lua"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

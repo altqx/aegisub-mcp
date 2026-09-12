@@ -94,6 +94,8 @@ TOOL_MODULES: tuple[str, ...] = (
     "aegisub_mcp.tools.karaoke_tools",
     "aegisub_mcp.tools.tags_tools",
     "aegisub_mcp.tools.drawing_tools",
+    "aegisub_mcp.tools.automation_tools",
+    "aegisub_mcp.tools.bridge_tools",
 )
 
 #: Public tools in this project are module-level callables with this prefix.

@@ -50,6 +50,8 @@ TOOL_MODULES: tuple[str, ...] = (
     "aegisub_mcp.tools.karaoke_tools",
     "aegisub_mcp.tools.tags_tools",
     "aegisub_mcp.tools.drawing_tools",
+    "aegisub_mcp.tools.automation_tools",
+    "aegisub_mcp.tools.bridge_tools",
 )
 
 #: A few names that must survive any refactor of the registration wiring.
@@ -64,6 +66,9 @@ ANCHOR_TOOLS: tuple[str, ...] = (
     "ass_karaoke_get",
     "ass_parse_text",
     "ass_get_drawing",
+    "ass_automation_run_macro",
+    "ass_bridge_publish",
+    "ass_bridge_events",
 )
 
 #: The fixture is small and fixed: 1 dialogue + 1 comment.
@@ -79,7 +84,7 @@ REPORT_PREFIX = "MCP STDIO REPORT: "
 
 
 def _expected_tool_names() -> set[str]:
-    """Every public ``ass_*`` callable the six tool modules define right now."""
+    """Every public ``ass_*`` callable the tool modules define right now."""
     sys.path.insert(0, str(SRC_DIR))  # pyproject's pythonpath=[src] does this too
     names: set[str] = set()
     for dotted in TOOL_MODULES:
@@ -341,6 +346,8 @@ def test_stdio_server_keeps_stdout_free_of_diagnostics(tmp_path: Path) -> None:
         f"{proc.stdout[:400]!r}"
     )
     stderr = proc.stderr.decode(errors="replace")
-    assert re.search(r"registered \d+ tool\(s\) from 6 module\(s\)", stderr), (
+    # The count is derived, not hardcoded: the summary must agree with the modules
+    # this test mirrors (and with ``aegisub_mcp.server.TOOL_MODULES``).
+    assert re.search(rf"registered \d+ tool\(s\) from {len(TOOL_MODULES)} module\(s\)", stderr), (
         f"registration summary missing from stderr:\n{stderr}"
     )
