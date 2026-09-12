@@ -24,6 +24,9 @@ metrics = ["fonttools>=4.50", "uharfbuzz>=0.39"]
 
 [project.scripts]
 aegisub-mcp = "aegisub_mcp.server:main"
+# Streamable HTTP, the only transport that can serve protocol 2026-07-28 (the
+# stateless per-request envelope); see src/aegisub_mcp/http_server.py.
+aegisub-mcp-http = "aegisub_mcp.http_server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aegisub_mcp"]

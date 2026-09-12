@@ -34,14 +34,19 @@ PYTHONPATH=src .venv/bin/python -m aegisub_mcp
 
 ## Running
 
+Two entry points over one tool surface: `aegisub-mcp` (stdio) and `aegisub-mcp-http`
+(streamable HTTP, the transport that serves protocol `2026-07-28`).
+
+### stdio — the default
+
 `aegisub-mcp` speaks MCP over **stdio**; stdout carries JSON-RPC framing and nothing
 else, all diagnostics go to stderr.
 
 Over stdio the server negotiates protocol revision **2025-11-25** — the newest revision
 reachable through the `initialize` handshake. Revision `2026-07-28` is the *stateless*
 per-request revision (no handshake, no session; carried by the `MCP-Protocol-Version`
-header) and is served only over the HTTP envelope, which this stdio entrypoint does not
-implement. A client that asks for `2026-07-28` is therefore counter-offered
+header) and can only be served over HTTP, which this entrypoint does not carry: use
+`aegisub-mcp-http` below. A client that asks stdio for `2026-07-28` is counter-offered
 `2025-11-25`. Verify with any client, or by hand:
 
 ```bash
@@ -55,7 +60,54 @@ aegisub-mcp                                  # console script, once installed
 PYTHONPATH=src python -m aegisub_mcp         # from a checkout
 ```
 
-A typical MCP client entry:
+### Streamable HTTP — protocol 2026-07-28
+
+`aegisub-mcp-http` serves the same tools at `POST /mcp`. Because `2026-07-28` is
+stateless, each request is self-contained: the revision and the client capabilities
+ride in the request's `_meta` envelope and its `MCP-Protocol-Version` / `Mcp-Method` /
+`Mcp-Name` headers, there is no `initialize` and no session id. The handshake
+replacement is `server/discover`.
+
+Legacy clients that send no `MCP-Protocol-Version` header (or a handshake revision) are
+served exactly as before on the same URL, so one endpoint answers both eras. Open
+documents live in the server process, not in a session — a document opened by one POST
+is still open for the next one.
+
+```bash
+aegisub-mcp-http --host 127.0.0.1 --port 8000                             # installed
+PYTHONPATH=src .venv/bin/python -m aegisub_mcp.http_server --port 8000     # checkout
+```
+
+It binds to loopback by default. `--help` lists `--path`, `--json-response`,
+`--stateless`, and `--allow-host` / `--allow-origin`: the MCP SDK's DNS-rebinding
+protection is enabled automatically for loopback binds, and binding anywhere else turns
+it on only when you name the allowed hosts (state both, or every request is refused with
+`Invalid Host header`).
+
+Verify the modern path by hand — one POST, no handshake:
+
+```bash
+curl -sS http://127.0.0.1:8000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: server/discover' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+# -> "supportedVersions":["2026-07-28"], "resultType":"complete", and no Mcp-Session-Id
+```
+
+A tool call is the same shape with `Mcp-Method: tools/call`, `Mcp-Name: <tool>`, and the
+usual `params.name` / `params.arguments`:
+
+```bash
+curl -sS http://127.0.0.1:8000/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'MCP-Protocol-Version: 2026-07-28' \
+  -H 'Mcp-Method: tools/call' -H 'Mcp-Name: ass_open' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ass_open","arguments":{"path":"/path/to/file.ass"},"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+```
+
+A typical MCP client entry (stdio):
 
 ```json
 {
@@ -136,9 +188,10 @@ build output, not source, and is git-ignored.
 .venv/bin/python -m pytest tests/test_tools_lines.py -v
 ```
 
-The suite drives the tool layer directly (`tests/test_tools_*.py`) as well as the stdio
-server end to end (`tests/test_server_stdio.py`), and uses the frozen files in
-`tests/fixtures/real/` as round-trip fixtures.
+The suite drives the tool layer directly (`tests/test_tools_*.py`), the stdio server end to
+end (`tests/test_server_stdio.py`), and the HTTP entry point end to end
+(`tests/test_http_server.py`, which boots the real server and speaks `2026-07-28` over the
+wire), and uses the frozen files in `tests/fixtures/real/` as round-trip fixtures.
 
 ## License
 
