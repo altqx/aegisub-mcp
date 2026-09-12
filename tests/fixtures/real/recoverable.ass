@@ -1,0 +1,11 @@
+[Script Info]
+Title: Recoverable malformed fixture
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize
+Style: Default,Arial
+
+[Events]
+Format: Layer, Start, End, Style, Text
+Dialogue: 0,not-a-time,0:00:02.00,Missing,{\pos(bad)}unterminated {
+UnknownRecord: preserve,this,exactly

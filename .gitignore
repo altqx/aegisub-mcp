@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtualenv
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Tool output (AEGISUB_MCP_OUT, else ./aegisub-mcp-out)
+aegisub-mcp-out/
+
+# Local scratch
+*.log
+*.tmp
+.DS_Store

@@ -1,0 +1,19 @@
+[Script Info]
+ScriptType: v4.00
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour
+Style: Default,Arial,20,&H00FFFFFF
+Style: malformed
+
+[Events]
+Format: Marked, Start, End, Style, Actor, Text
+Dialogue: malformed
+Dialogue: Marked=0,0:00:01.00,0:00:02.00,Default,Valid,Before unknown
+
+[Vendor Private]
+Format: this,is,not,an,event,format
+Dialogue: preserve,this,unknown,row,byte,exactly
+
+[Events]
+Dialogue: Marked=1,0:00:03.00,0:00:04.00,Default,Valid,After unknown

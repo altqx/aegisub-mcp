@@ -1,0 +1,16 @@
+[Script Info]
+Title: Legacy attachment fixture
+ScriptType: v4.00+
+
+[Fonts]
+fontname: Sample_0.ttf
+!!%#!Q1&"A=)#1I,$!U/$R!2%B-5&298'"E;'RQ>(B]A)3)D*#5G*SAJ+CMM,3YP-$%S-T1V.D=Y/4I\
+0!
+
+[Graphics]
+filename: card.png
+C6"/2QU+'AI
+
+[Events]
+Format: Layer, Start, End, Style, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,fixture

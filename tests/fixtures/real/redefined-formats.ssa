@@ -1,0 +1,14 @@
+[Script Info]
+ScriptType: v4.00
+
+[V4 Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour
+Style: First,Arial,20,&H00FFFFFF
+Format: Fontname, Fontsize, Name, PrimaryColour, TertiaryColour
+Style: Times New Roman,24,Second,&H00FFFF00,&H000000FF
+
+[Events]
+Format: Marked, Start, End, Style, Actor, Text
+Dialogue: Marked=0,0:00:01.00,0:00:02.00,First,One,first event
+Format: Actor, Marked, End, Start, Style, Effect, Text
+Comment: Two,Marked=1,0:00:04.00,0:00:03.00,Second,note,second event, with comma

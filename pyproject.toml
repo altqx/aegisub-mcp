@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aegisub-mcp"
+version = "0.1.0"
+description = "Model Context Protocol server for Aegisub / ASS subtitles: line access, styles, tags, typesetting, drawing, clipping, karaoke, timing, Lua automations, QC and libass-rendered verification."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "altqx" }]
+keywords = ["aegisub", "ass", "subtitles", "mcp", "karaoke", "typesetting", "libass"]
+dependencies = [
+    "mcp>=1.2",
+    "lupa>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2"]
+metrics = ["fonttools>=4.50", "uharfbuzz>=0.39"]
+
+[project.scripts]
+aegisub-mcp = "aegisub_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aegisub_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

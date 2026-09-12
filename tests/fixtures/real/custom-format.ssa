@@ -1,0 +1,11 @@
+[Script Info]
+ScriptType: v4.00
+Title: Custom order and unknown fields
+
+[V4 Styles]
+Format: Fontname, Name, Fontsize, PrimaryColour, SecondaryColour, TertiaryColour, BackColour, Bold, Italic, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, AlphaLevel, Encoding, VendorStyleField
+Style: Arial,Custom,26,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,1,2,1,2,20,21,22,0,1,preserve-style
+
+[Events]
+Format: Start, End, Marked, Actor, Effect, Style, MarginV, MarginR, MarginL, VendorEventField, Text
+Dialogue: 0:00:01.00,0:00:03.25,Marked=1,Alice,banner,Custom,22,21,20,preserve-event,Custom SSA text, with commas

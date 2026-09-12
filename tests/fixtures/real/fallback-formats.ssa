@@ -1,0 +1,9 @@
+[Script Info]
+ScriptType: v4.00
+Title: SSA fallback formats
+
+[V4 Styles]
+Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,1,2,1,2,10,10,10,0,1
+
+[Events]
+Dialogue: Marked=1,0:00:01.00,0:00:02.00,Default,Fallback Actor,0,0,0,fallback,Fallback text
