@@ -11,7 +11,9 @@ Work happens on **open documents** held by the server: call `ass_open` (path) or
 ## Requirements
 
 - Python >= 3.10 (`requires-python` in `pyproject.toml`)
-- `mcp >= 1.2` (MCP SDK) and `lupa >= 2.0` (Lua automations) — installed automatically
+- `mcp >= 2.2` (MCP SDK) and `lupa >= 2.0` (Lua automations) — installed automatically.
+  The 2.x line is required: `mcp.server.mcpserver.MCPServer` (what `server.py` imports)
+  does not exist in 1.x, which exposes only `FastMCP` / `Server`.
 - Optional: `fonttools` + `uharfbuzz` for the font/glyph metrics tools (`pip install -e '.[metrics]'`)
 - Optional: `pytest` + `pytest-timeout` for development (`pip install -e '.[dev]'`)
 
@@ -34,6 +36,19 @@ PYTHONPATH=src .venv/bin/python -m aegisub_mcp
 
 `aegisub-mcp` speaks MCP over **stdio**; stdout carries JSON-RPC framing and nothing
 else, all diagnostics go to stderr.
+
+Over stdio the server negotiates protocol revision **2025-11-25** — the newest revision
+reachable through the `initialize` handshake. Revision `2026-07-28` is the *stateless*
+per-request revision (no handshake, no session; carried by the `MCP-Protocol-Version`
+header) and is served only over the HTTP envelope, which this stdio entrypoint does not
+implement. A client that asks for `2026-07-28` is therefore counter-offered
+`2025-11-25`. Verify with any client, or by hand:
+
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' \
+  | PYTHONPATH=src .venv/bin/python -m aegisub_mcp | head -1
+# -> "protocolVersion":"2025-11-25"
+```
 
 ```bash
 aegisub-mcp                                  # console script, once installed
