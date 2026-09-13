@@ -230,40 +230,60 @@ def ass_bridge_events(since: int = 0, limit: int = 50,
 def ass_bridge_watch(seconds: float = 5.0,
                      interval: float = 0.25,
                      kinds: Sequence[str] | None = None,
+                     stop_after: int | None = None,
                      bridge_dir: str | None = None,
                      user_dir_override: str | None = None) -> dict[str, Any]:
-    """Wait up to ``seconds`` for Aegisub to change something, then report it.
+    """Stream what Aegisub does for up to ``seconds`` and report every change.
 
     This is how an MCP client observes the editor in near realtime without a
     daemon: the call polls the bridge directory (default every 0.25 s), records
-    new events in the journal and returns early as soon as one arrives.  An empty
-    ``events`` list means Aegisub was quiet for the whole window -- it is not an
-    error.
+    new events in the journal and keeps going for the whole window, so a client
+    can watch an editing session instead of taking one sample of it.  Pass
+    ``stop_after`` to come back once N matching events have arrived (a "wake me
+    on the next change"), or ``kinds`` to watch one channel only.
+
+    ``events`` are the things that changed *while watching*.  The first poll
+    establishes the baseline and anything it reports had already happened, so it
+    comes back separately as ``caught_up`` and does not satisfy ``stop_after`` --
+    otherwise a fresh bridge would return instantly with stale state and never
+    see the edit the caller started watching for.  A client looping on this tool
+    should treat ``caught_up`` and ``events`` alike as input.
+
+    An empty ``events`` list means Aegisub was quiet for the whole window; it is
+    not an error, and ``waited_s`` tells you how long that was.
     """
     bridge = _bridge(bridge_dir)
     base = Path(user_dir_override).expanduser() if user_dir_override else None
-    deadline = seconds
-    collected: list[dict[str, Any]] = []
     seen_snapshot = bridge.last_seen()
     started = bridge.read_state().get("ae_rev")
-    while True:
-        for event in bridge.poll():
-            if kinds and event.kind not in kinds:
-                continue
-            collected.append(event.to_dict())
-        if collected:
-            break
-        deadline -= interval
-        if deadline <= 0:
-            break
-        import time as _time
 
-        _time.sleep(max(0.02, interval))
+    def _matching(events: Any) -> list[dict[str, Any]]:
+        return [e.to_dict() for e in events if not kinds or e.kind in kinds]
+
+    import time as _time
+
+    started_at = _time.monotonic()
+    deadline = started_at + max(0.0, seconds)
+
+    catch_up = _matching(bridge.poll())
+    collected: list[dict[str, Any]] = []
+    while True:
+        if stop_after is not None and len(collected) >= stop_after:
+            break
+        now = _time.monotonic()
+        if now >= deadline:
+            break
+        _time.sleep(min(max(0.02, interval), deadline - now))
+        collected.extend(_matching(bridge.poll()))
+
     out: dict[str, Any] = {
         "bridge_dir": str(bridge.dir),
-        "waited_s": round(max(0.0, seconds - max(0.0, deadline)), 3),
+        "waited_s": round(_time.monotonic() - started_at, 3),
         "count": len(collected),
         "events": collected,
+        "caught_up": catch_up,
+        "caught_up_count": len(catch_up),
+        "stop_after": stop_after,
         "seen_before": seen_snapshot,
         "ae_rev_before": started,
         "ae_rev_after": bridge.read_state().get("ae_rev"),

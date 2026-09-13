@@ -1,9 +1,11 @@
 # aegisub-mcp
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server for Aegisub / ASS
-subtitles. It exposes 121 tools that read and edit subtitle documents, plus a
-libass-backed verification layer, so an MCP client (Hermes, Claude Desktop, Codex, …)
-can do real subtitle work instead of text munging.
+subtitles. It exposes 138 tools that read and edit subtitle documents, run real
+Aegisub Automation 4 scripts (Lua) against them, and bridge a running Aegisub instance
+to the MCP client over a shared directory — plus a libass-backed verification layer, so
+an MCP client (Hermes, Claude Desktop, Codex, …) can do real subtitle work instead of
+text munging.
 
 Work happens on **open documents** held by the server: call `ass_open` (path) or
 `ass_new_document` first, then address the returned `doc_id` with the other tools.
@@ -16,6 +18,8 @@ Work happens on **open documents** held by the server: call `ass_open` (path) or
   does not exist in 1.x, which exposes only `FastMCP` / `Server`.
 - Optional: `fonttools` + `uharfbuzz` for the font/glyph metrics tools (`pip install -e '.[metrics]'`)
 - Optional: `pytest` + `pytest-timeout` for development (`pip install -e '.[dev]'`)
+- For the live bridge: Aegisub itself (3.4.x tested) needs no Python at all — it runs the
+  generated Lua. `xdotool`/`ydotool` is optional and only used by `ass_bridge_inject`.
 
 ## Install
 
@@ -125,8 +129,8 @@ For an uninstalled checkout use `"command": "python"` with
 
 ## Tool areas
 
-Tools are registered from six modules under `src/aegisub_mcp/tools/`; every tool name
-starts with the `ass_` prefix.
+Tools are registered from eight modules under `src/aegisub_mcp/tools/` (138 in total);
+every tool name starts with the `ass_` prefix.
 
 - **lines** (30) — document lifecycle and event lines: `ass_open`, `ass_new_document`,
   `ass_save`, `ass_list_lines`, `ass_get_line`, `ass_update_line(s)`, `ass_add_line(s)`,
@@ -152,6 +156,85 @@ starts with the `ass_` prefix.
   `ass_set_drawing`, `ass_drawing_bbox`, `ass_drawing_to_svg`, `ass_svg_to_drawing`,
   `ass_scale_drawing`, `ass_join_drawings`, `ass_split_drawing`, `ass_get_clips`,
   `ass_set_clip`, `ass_remove_clip`, `ass_glyph_check`, `ass_list_fonts`, `ass_match_font`, …
+- **automation_tools** (7) — run real Aegisub Automation 4 Lua: `ass_automation_dirs`,
+  `ass_automation_list`, `ass_automation_info`, `ass_automation_run_macro`,
+  `ass_automation_run_filter`, `ass_automation_run_filters`, `ass_automation_from_source`
+- **bridge_tools** (10) — talk to a running Aegisub: `ass_bridge_publish`,
+  `ass_bridge_pull`, `ass_bridge_status`, `ass_bridge_live`, `ass_bridge_events`,
+  `ass_bridge_watch`, `ass_bridge_autosave`, `ass_bridge_install`, `ass_bridge_paths`,
+  `ass_bridge_inject`
+
+## Driving Aegisub itself
+
+The document tools work on files; the last two modules work on *Aegisub*.
+
+### Automation 4
+
+`ass_automation_run_macro`, `ass_automation_run_filter(s)` and
+`ass_automation_from_source` execute genuine Automation 4 Lua against the open document
+with the API surface Aegisub provides (`subs`, `aegisub.dialog.display`,
+`aegisub.set_undo_point`, progress, …) — no reimplementation of the subtitle model, the
+same host Aegisub uses. `ass_automation_dirs` / `ass_automation_list` /
+`ass_automation_info` show what is installed in `?user/automation`. A macro that raises
+inside Lua is reported as a failure, never as a half-applied edit: the undo snapshot and
+the apply path are shared with the document layer.
+
+### The live bridge
+
+Aegisub has **no MCP client, no socket API and no inbound trigger hook**, so the bridge
+uses a shared directory of small TSV/ASS files. That is what makes it portable to Linux,
+Windows and macOS, Wayland included: nothing depends on owning a window or injecting
+keystrokes.
+
+```bash
+aegisub-mcp-bridge install              # write the Aegisub-side script + hotkey
+aegisub-mcp-bridge install --dry-run    # show the config diff first
+aegisub-mcp-bridge status               # bridge dir, install state, autosave settings
+```
+
+Then restart Aegisub: autoload scripts load at startup. The script adds two macros to
+the Automation menu — `krapau-bridge: Pull changes from MCP` (default hotkey
+`Ctrl-Alt-M`) and `krapau-bridge: Push my document to MCP`:
+
+- **MCP → Aegisub**: `ass_bridge_publish` queues a revision; the pull macro applies it
+  to the open document, then writes an acknowledgement with a line count.
+- **Aegisub → MCP**: the macro writes state/snapshot files; polling them turns file
+  changes into events, and `ass_bridge_live` reports which artifact is current.
+
+The bridge directory is `$AEGISUB_MCP_BRIDGE` when set (run `aegisub-mcp-bridge paths`
+for the resolved default).
+
+`ass_bridge_watch` is the realtime view. It streams the bridge for `seconds` and reports
+what changed **while watching** as `events`; whatever had already happened before the
+watch began comes back separately as `caught_up`, because the first poll only
+establishes the baseline — it never ends the watch early. `stop_after=1` returns on the
+next change, `kinds=[...]` follows one channel. Event kinds:
+
+- `aegisub.state` — the macro ran; the document revision moved
+- `aegisub.applied` — a published revision was applied or refused, with a line count
+- `aegisub.snapshot` — the snapshot file changed
+- `aegisub.source` — Aegisub saved the file the user is editing, in place
+- `aegisub.autosave` — a new autosave copy appeared
+
+A macro whose `validate()` returns false is **disabled** by Aegisub, so the pull hotkey
+does nothing while no revision is pending. That is the designed behaviour, not a broken
+key binding.
+
+### Realtime without a daemon
+
+Aegisub writes files in exactly two situations, and `install` sets up both:
+
+- `App/Auto/Save on Every Change` rewrites the user's own file on every change — always
+  current, but it overwrites their file, so it stays **opt-in**: `--save-on-every-change`.
+- `App/Auto/Save` + `Save Every Seconds` (install default: 5) writes
+  `<name>.<timestamp>.AUTOSAVE.ass` into `?user/autosave`. An interval of `0` switches
+  the timer off completely, so `install` never sets 0.
+
+`--no-autosave` leaves Aegisub's own settings alone. Either way the resulting file change
+surfaces through `ass_bridge_watch` as `aegisub.source` / `aegisub.autosave`.
+`ass_bridge_inject` presses the pull hotkey with `xdotool`/`ydotool` where one exists —
+a convenience for triggering a macro, never the data path (X11-only, so it is not used
+by the bridge itself).
 
 ## Tool results
 
@@ -192,6 +275,13 @@ The suite drives the tool layer directly (`tests/test_tools_*.py`), the stdio se
 end (`tests/test_server_stdio.py`), and the HTTP entry point end to end
 (`tests/test_http_server.py`, which boots the real server and speaks `2026-07-28` over the
 wire), and uses the frozen files in `tests/fixtures/real/` as round-trip fixtures.
+
+The Aegisub-facing half is tested the same way: `tests/test_automation_tools.py` runs
+Automation 4 scripts through the Lua host, `tests/test_bridge_lua.py` renders and executes
+the *generated* bridge script (the same file `install` writes into `?user`), and
+`tests/test_bridge_tools.py` drives the MCP half against a bridge directory — install,
+publish, apply, poll, watch and the autosave channel. Nothing is mocked: the Lua side is
+the real script and the Python side is the real tool layer.
 
 ## License
 

@@ -11,6 +11,7 @@ against the same bridge directory.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,19 @@ FIXTURE = Path(__file__).resolve().parent / "fixtures" / "real" / "basic.ass"
 
 PULL = "krapau-bridge: Pull changes from MCP"
 PUSH = "krapau-bridge: Push my document to MCP"
+
+
+def _write_state(bridge: Bridge, **rows: object) -> None:
+    """Rewrite the bridge state file the way Aegisub's macro does.
+
+    Used to make Aegisub "act" while a watch is in flight; running Lua from a
+    timer thread would be a thread-safety problem in the test, and this is the
+    same file content the macro writes.
+    """
+    current = {key: str(value) for key, value in bridge.read_state().items()}
+    current.update({key: str(value) for key, value in rows.items()})
+    body = "".join(f"{key}\t{value}\n" for key, value in current.items())
+    bridge.state_path.write_text(body, encoding="utf-8")
 
 
 @pytest.fixture(autouse=True)
@@ -163,18 +177,42 @@ class TestRealtime:
         assert again["last_seq"] == events["last_seq"]
 
     def test_watch_returns_as_soon_as_aegisub_moves(self, installed_bridge: dict) -> None:
-        """A watch started before Aegisub acts returns that event, not a timeout."""
+        """A watch started before Aegisub acts comes back with that event."""
+        bridge = installed_bridge["bridge"]
+        # Aegisub acts *during* the watch -- that is the whole point of watching.
+        threading.Timer(0.2, lambda: _write_state(bridge, ae_rev=9)).start()
+
+        payload = B.ass_bridge_watch(seconds=3.0, interval=0.05, stop_after=1,
+                                     kinds=["aegisub.state"], bridge_dir=str(bridge.dir))
+        assert payload["count"] >= 1
+        assert payload["waited_s"] < 3.0
+        assert "aegisub.state" in [event["kind"] for event in payload["events"]]
+
+    def test_watch_streams_the_whole_window(self, bridge_dir: Path) -> None:
+        """Without ``stop_after`` a watch runs its full window instead of sampling."""
+        Bridge(bridge_dir).ensure()
+        payload = B.ass_bridge_watch(seconds=0.6, interval=0.05,
+                                     bridge_dir=str(bridge_dir))
+        assert payload["events"] == []
+        assert payload["count"] == 0
+        assert payload["waited_s"] >= 0.5, payload["waited_s"]
+
+    def test_first_sighting_does_not_stop_a_watch(self, installed_bridge: dict) -> None:
+        """What happened before the watch started is catch-up, not a reason to return."""
         bridge = installed_bridge["bridge"]
         doc = AssDocument.load(str(FIXTURE))
         engine = LuaEngine(doc)
         engine.load_file(installed_bridge["script"])
         engine.run_macro(PUSH)
 
-        payload = B.ass_bridge_watch(seconds=1.0, interval=0.05,
+        payload = B.ass_bridge_watch(seconds=0.5, interval=0.05,
                                      bridge_dir=str(bridge.dir))
-        assert payload["count"] >= 1
-        assert payload["waited_s"] < 1.0
-        assert "aegisub.state" in [event["kind"] for event in payload["events"]]
+        assert payload["count"] == 0
+        assert payload["events"] == []
+        assert payload["caught_up_count"] >= 1
+        assert "aegisub.state" in [event["kind"] for event in payload["caught_up"]]
+        # A fresh bridge used to answer with stale state on the first poll.
+        assert payload["waited_s"] >= 0.4, payload["waited_s"]
 
     def test_watch_is_quiet_when_aegisub_is(self, bridge_dir: Path) -> None:
         Bridge(bridge_dir).ensure()
